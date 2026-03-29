@@ -103,7 +103,7 @@ def AlltoAll(tensor):
     
     for i in range(world_size):
         if i != rank:
-            send_op = dist.P2POp(dist.isend, tensor_chunks[i], dst = i)
+            send_op = dist.P2POp(dist.isend, tensor_chunks[i], peer = i)
             send_ops.append(send_op)
         else:
             continue
@@ -111,7 +111,7 @@ def AlltoAll(tensor):
     for i in range(world_size):
         buffer = torch.empty_like(tensor_chunks[0])
         if i != rank:
-            recv_op = dist.P2POp(dist.irecv, buffer, src = i)
+            recv_op = dist.P2POp(dist.irecv, buffer, peer = i)
             recv_ops.append(recv_op)
             full_tensor[i] = buffer
         else:
