@@ -118,7 +118,7 @@ def test_allgather():
     dist.all_gather(ref_chunks, chunk.clone())
     ref = torch.cat(ref_chunks)
 
-    result_chunks = AllGather(chunk.clone())
+    result_chunks = AllGather(chunk)
     result = torch.cat(result_chunks)
     passed = torch.allclose(result, ref)
     log(rank, "allgather", passed)
@@ -188,8 +188,8 @@ def main():
     test_allreduce()
     dist.barrier()
 
-    # test_reduce_scatter()
-    # dist.barrier()
+    test_reduce_scatter()
+    dist.barrier()
 
     # test_allgather()
     # dist.barrier()

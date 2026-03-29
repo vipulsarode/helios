@@ -52,13 +52,21 @@ def ReduceScatter(tensor):
     
     left_rank = (rank - 1) % world_size
     right_rank = (rank + 1) % world_size    
-    
-    for i in range(world_size):
-            dist.send(tensor_chunks[(rank-i)%world_size], dst = right_rank)
-            dist.recv(buffer, src = left_rank)
-            tensor_chunks[(left_rank - i) % world_size] += buffer
             
+    for i in range(world_size-1):
+        if rank % 2 == 0:
+            dist.send(tensor_chunks[(rank-i-1)%world_size], dst = right_rank)
+            dist.recv(buffer, src = left_rank)
+            tensor_chunks[(rank-i-2) % world_size] += buffer.clone()
+            
+        else:
+            dist.recv(buffer, src = left_rank)
+            tensor_chunks[(rank-i-2) % world_size] += buffer.clone()
+            dist.send(tensor_chunks[(rank-i-1)%world_size], dst = right_rank)
+    
     return tensor_chunks[rank]
+    
+    
 
 
 def AllGather(reduced_chunk):
@@ -74,11 +82,22 @@ def AllGather(reduced_chunk):
     full_tensor = [None] * world_size
     full_tensor[rank] = reduced_chunk
     
-    for i in range(world_size-1):
-        dist.send(full_tensor[(rank-i)%world_size], dst = right_rank)
-        dist.recv(buffer, src = left_rank)
-        full_tensor[(left_rank - i)%world_size] = buffer.clone()
-    
+    # for i in range(world_size-1):
+    #     dist.send(full_tensor[(rank-i)%world_size], dst = right_rank)
+    #     dist.recv(buffer, src = left_rank)
+    #     full_tensor[(left_rank - i)%world_size] = buffer.clone()
+
+    for i in range(world_size):
+        if rank % 2 == 0:
+            dist.send(full_tensor[(rank-i)%world_size], dst = right_rank)
+            dist.recv(buffer, src = left_rank)
+            full_tensor[(left_rank - i) % world_size] += buffer.clone()
+        else:
+            dist.recv(buffer, src = left_rank)
+            full_tensor[(left_rank - i) % world_size] += buffer.clone()
+            dist.send(full_tensor[(rank-i)%world_size], dst = right_rank)
+
+
     return full_tensor
 
 
