@@ -13,6 +13,7 @@ Helios started as a learning project — a way to deeply understand distributed 
 
 ### 🔜 Up next
 - Async collective operations
+- Process Group Manager
 - Data Parallelism (DDP)
 - Fully Sharded Data Parallelism (FSDP)
 - Tensor Parallelism (TP)
