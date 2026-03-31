@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 import os
 
-from src.collectives import AllGather, AllReduce, AlltoAll, ReduceScatter, RingAllReduce, broadcast, reduce
+from src.collectives.collectives import RingAllGather, AllGather, AllReduce, AlltoAll, ReduceScatter, RingAllReduce, broadcast, reduce
 
 
 def init():
@@ -123,6 +123,26 @@ def test_allgather():
     passed = torch.allclose(result, ref)
     log(rank, "allgather", passed)
 
+def test_ringallgather():
+    """
+    Each rank starts with a chunk filled with its own rank value.
+    After allgather, every rank must hold [0,0,...,1,1,...,2,2,...].
+    """
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    chunk = torch.full((4,), float(rank))
+
+    # ground truth
+    ref_chunks = [torch.zeros(4) for _ in range(world_size)]
+    dist.all_gather(ref_chunks, chunk.clone())
+    ref = torch.cat(ref_chunks)
+
+    result_chunks = RingAllGather(chunk)
+    result = torch.cat(result_chunks)
+    passed = torch.allclose(result, ref)
+    log(rank, "ringallgather", passed)
+
 
 def test_ring_allreduce():
     """
@@ -191,11 +211,14 @@ def main():
     test_reduce_scatter()
     dist.barrier()
 
-    # test_allgather()
-    # dist.barrier()
+    test_allgather()
+    dist.barrier()
 
-    # test_ring_allreduce()
-    # dist.barrier()
+    test_ringallgather()
+    dist.barrier()    
+    
+    test_ring_allreduce()
+    dist.barrier()
 
     test_alltoall()
     dist.barrier()

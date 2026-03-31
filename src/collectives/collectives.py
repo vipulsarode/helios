@@ -74,6 +74,33 @@ def AllGather(reduced_chunk):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
+    # left_rank = (rank - 1) % world_size
+    # right_rank = (rank + 1) % world_size
+
+    buffer = torch.empty_like(reduced_chunk)
+
+    full_tensor = [None] * world_size
+    full_tensor[rank] = reduced_chunk
+
+   
+    for i in range(world_size):
+        if rank == i:
+            for dst in range(world_size):
+                if dst != rank:
+                    dist.send(full_tensor[rank], dst = dst)
+        else:
+            dist.recv(buffer, src = i)
+            full_tensor[i] = buffer.clone()        
+
+
+
+    return full_tensor
+
+def RingAllGather(reduced_chunk):
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
     left_rank = (rank - 1) % world_size
     right_rank = (rank + 1) % world_size
 
@@ -81,24 +108,19 @@ def AllGather(reduced_chunk):
 
     full_tensor = [None] * world_size
     full_tensor[rank] = reduced_chunk
-    
-    # for i in range(world_size-1):
-    #     dist.send(full_tensor[(rank-i)%world_size], dst = right_rank)
-    #     dist.recv(buffer, src = left_rank)
-    #     full_tensor[(left_rank - i)%world_size] = buffer.clone()
 
     for i in range(world_size):
         if rank % 2 == 0:
-            dist.send(full_tensor[(rank-i)%world_size], dst = right_rank)
+            dist.send(full_tensor[rank-i], dst = right_rank)
             dist.recv(buffer, src = left_rank)
-            full_tensor[(left_rank - i) % world_size] += buffer.clone()
+            full_tensor[left_rank-i] = buffer.clone()
         else:
             dist.recv(buffer, src = left_rank)
-            full_tensor[(left_rank - i) % world_size] += buffer.clone()
-            dist.send(full_tensor[(rank-i)%world_size], dst = right_rank)
-
+            full_tensor[left_rank-i] = buffer.clone()
+            dist.send(full_tensor[rank-i], dst = right_rank)
 
     return full_tensor
+
 
 
 def RingAllReduce(tensor):
