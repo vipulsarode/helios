@@ -41,7 +41,7 @@ def AllReduce(tensor, dst = 0):
     return tensor
 
 
-def ReduceScatter(tensor):
+def RingReduceScatter(tensor):
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -69,7 +69,7 @@ def ReduceScatter(tensor):
     
 
 
-def AllGather(reduced_chunk):
+def NaiveAllGather(reduced_chunk):
     
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -124,8 +124,8 @@ def RingAllGather(reduced_chunk):
 
 
 def RingAllReduce(tensor):
-    reduced_chunk = ReduceScatter(tensor)
-    full_tensor = AllGather(reduced_chunk)
+    reduced_chunk = RingReduceScatter(tensor)
+    full_tensor = RingAllGather(reduced_chunk)
     return torch.cat(full_tensor)
 
 def AlltoAll(tensor):

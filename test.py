@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 import os
 
-from src.collectives.collectives import RingAllGather, AllGather, AllReduce, AlltoAll, ReduceScatter, RingAllReduce, broadcast, reduce
+from src.collectives.collectives import RingAllGather, NaiveAllGather, AllReduce, AlltoAll, RingReduceScatter, RingAllReduce, broadcast, reduce
 
 
 def init():
@@ -98,7 +98,7 @@ def test_reduce_scatter():
     ref = torch.zeros(4)
     dist.reduce_scatter_tensor(ref, tensor.clone())
 
-    result = ReduceScatter(tensor.clone())
+    result = RingReduceScatter(tensor.clone())
     passed = torch.allclose(result, ref)
     log(rank, "reduce_scatter", passed)
 
@@ -118,7 +118,7 @@ def test_allgather():
     dist.all_gather(ref_chunks, chunk.clone())
     ref = torch.cat(ref_chunks)
 
-    result_chunks = AllGather(chunk)
+    result_chunks = NaiveAllGather(chunk)
     result = torch.cat(result_chunks)
     passed = torch.allclose(result, ref)
     log(rank, "allgather", passed)
