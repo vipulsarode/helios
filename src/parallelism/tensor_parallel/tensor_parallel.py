@@ -309,13 +309,43 @@ class TensorParallelAttention(nn.Module):
     ):
         super().__init__()
         # TODO: Q/K/V as ColumnParallel (gather_output=False), O as RowParallel
-        pass
+        
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+        self.group = group
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        assert self.num_heads % self.world_size == 0, "num_heads should be perfectly divisible by world_size"
+        
+        self.local_heads = self.num_heads // self.world_size
+        self.head_dim = self.hidden_size // self.num_heads
+
+        self.q = ColumnParallelLinear(self.hidden_size,  self.hidden_size, group=self.group, bias=False, gather_output=False) 
+        self.k = ColumnParallelLinear(self.hidden_size,  self.hidden_size, group=self.group, bias=False, gather_output=False) 
+        self.v = ColumnParallelLinear(self.hidden_size,  self.hidden_size, group=self.group, bias=False, gather_output=False) 
+
+        self.o = RowParallelLinear(self.hidden_size, self.hidden_size, group=self.group, bias=False, input_is_parallel=True)
 
     def forward(self, x: Tensor) -> Tensor:
         # TODO: project, reshape to local heads, attention, project back
-        pass
+        
+        Q = self.q(x)
+        K = self.k(x)
+        V = self.v(x)
 
+        B, S, H = x.shape
 
+        Q = Q.reshape(B, S, self.local_heads, self.head_dim).transpose(-2, -3)
+        K = K.reshape(B, S, self.local_heads, self.head_dim).transpose(-2, -3)
+        V = V.reshape(B, S, self.local_heads, self.head_dim).transpose(-2, -3)
+        
+        attention = torch.softmax(Q@K.transpose(-1, -2)/(self.head_dim**0.5), dim = -1)@V
+        attention = attention.transpose(-2, -3)
+        attention = attention.contiguous().reshape(B, S, self.local_heads*self.head_dim)
+
+        output = self.o(attention)
+        
+        return output
 # =============================================================================
 # SECTION 6: Weight Loading / Sharding Utilities
 # =============================================================================
