@@ -283,10 +283,15 @@ class TensorParallelMLP(nn.Module):
     ):
         super().__init__()
         # TODO: wire up ColumnParallelLinear and RowParallelLinear
-        pass
+        self.group = group
+        self.model = nn.Sequential(
+            ColumnParallelLinear(hidden_size, intermediate_size, group=self.group, bias=True, gather_output=False),
+            nn.GELU(),
+            RowParallelLinear(intermediate_size, hidden_size, group=self.group, bias=True, input_is_parallel=True)
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        pass
+        return self.model(x)
 
 
 class TensorParallelAttention(nn.Module):
