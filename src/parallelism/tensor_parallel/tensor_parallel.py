@@ -233,11 +233,35 @@ class ParallelEmbedding(nn.Module):
     ):
         super().__init__()
         # TODO: compute local vocab range, create local embedding
-        pass
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.group = group
 
+        self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+        
+        self.local_vocab_size = num_embeddings//self.world_size  
+        self.local_vocab_range_start = self.rank*self.local_vocab_size
+        self.local_vocab_range_end = self.local_vocab_range_start + self.local_vocab_size
+
+        self.local_embedding = nn.Embedding(self.local_vocab_size, embedding_dim)
+
+    
     def forward(self, input: Tensor) -> Tensor:
         # TODO: mask, embed, all-reduce
-        pass
+
+        mask = ~((input >= self.local_vocab_range_start) & (input < self.local_vocab_range_end))
+        input = input - self.local_vocab_range_start
+        input = torch.where(mask, 0, input)
+
+        embedding = self.local_embedding(input)
+        embedding_mask = mask.unsqueeze(-1).expand_as(embedding)
+        embedding = torch.where(embedding_mask, 0, embedding)
+        
+        embedding = reduce_from_parallel_region(embedding, group=self.group)
+
+        return embedding
+        
 
 
 # =============================================================================
