@@ -353,6 +353,8 @@ class TensorParallelAttention(nn.Module):
 def shard_model_for_tp(
     model: nn.Module,
     group: dist.ProcessGroup,
+    column_parallel_patterns: list[str],
+    row_parallel_patterns: list[str]
 ) -> nn.Module:
     """Takes a full (unsharded) model and replaces layers with TP equivalents.
     
@@ -360,8 +362,41 @@ def shard_model_for_tp(
     - Slices pretrained weights correctly per rank.
     - Returns the modified model.
     """
-    pass
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    
+    tp_layer_replacements = []
 
+    for name, layer in model.named_modules():
+        parent_path, attr_name = name.rsplit(".", 1)
+        parent_module = model.get_submodule(parent_path)
+        if attr_name in column_parallel_patterns:
+            weight = layer.weight
+            bias = layer.bias
+            new_cp_layer = ColumnParallelLinear(layer.in_features, layer.out_features, group=group, bias=True, gather_output=False)
+            shard_dim = layer.out_features//world_size
+            weight_shard = weight[rank*shard_dim : rank*shard_dim + shard_dim, :]
+            if bias is not None:
+                bias_shard = bias[rank*shard_dim : rank*shard_dim + shard_dim]
+                new_cp_layer.bias = nn.Parameter(bias_shard)
+            new_cp_layer.weight = nn.Parameter(weight_shard)           
+            tp_layer_replacements.append((parent_module, attr_name, new_cp_layer))
+        
+        elif attr_name in row_parallel_patterns:
+            weight = layer.weight
+            bias = layer.bias
+            new_rp_layer = RowParallelLinear(layer.in_features, layer.out_features, group=group, bias=True, input_is_parallel=False)
+            shard_dim = layer.in_features//world_size
+            weight_shard = weight[:, rank*shard_dim : rank*shard_dim + shard_dim]
+            new_rp_layer.weight = nn.Parameter(weight_shard)
+            if bias is not None:
+                new_rp_layer.bias = nn.Parameter(bias)
+            tp_layer_replacements.append((parent_module, attr_name, new_rp_layer))
+    
+    for parent, attr, layer in tp_layer_replacements:
+        setattr(parent, attr, layer)
+    
+    return model
 
 def load_sharded_weights(
     model: nn.Module,
