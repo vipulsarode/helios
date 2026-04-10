@@ -64,7 +64,7 @@ class ScatterToParallelRegion(torch.autograd.Function):
     def backward(ctx, grad_output: Tensor):
         tensor_list = [torch.zeros_like(grad_output) for _ in range(ctx.world_size)]
         dist.all_gather(tensor_list=tensor_list, tensor=grad_output, group=ctx.group)
-        return torch.cat(tensor_list, dim=0), None
+        return torch.cat(tensor_list, dim=-1), None
 
 
 class GatherFromParallelRegion(torch.autograd.Function):
@@ -79,7 +79,7 @@ class GatherFromParallelRegion(torch.autograd.Function):
 
         tensor_list = [torch.zeros_like(input) for _ in range(ctx.world_size)]
         dist.all_gather(tensor_list=tensor_list, tensor=input, group=ctx.group)
-        return torch.cat(tensor_list, dim=0)
+        return torch.cat(tensor_list, dim=-1)
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
@@ -156,9 +156,9 @@ class ColumnParallelLinear(nn.Module):
 
     def forward(self, input: Tensor) -> Tensor:
     
-        input = copy_to_parallel_region(x, group=self.group)
+        input = copy_to_parallel_region(input, group=self.group)
 
-        x = F.Linear(input, self.weight, self.bias)
+        x = F.linear(input, self.weight, self.bias)
 
         if self.gather_output:
             x = gather_from_parallel_region(x, group = self.group)
@@ -196,7 +196,7 @@ class RowParallelLinear(nn.Module):
         self.weight = nn.Parameter(torch.Tensor(output_features, self.input_partition_size))
 
         if bias:
-            self.bias = nn.Parameter(torch.Tensor(self.input_partition_size))
+            self.bias = nn.Parameter(torch.Tensor(self.output_features))
             with torch.no_grad():
                 self.bias.zero_()
         else:
@@ -207,7 +207,7 @@ class RowParallelLinear(nn.Module):
         if not self.input_is_parallel:
             input = scatter_to_parallel_region(input, group=self.group)
 
-        x = F.Linear(input, self.weight)
+        x = F.linear(input, self.weight)
 
         x = reduce_from_parallel_region(x, group=self.group)
 
@@ -368,12 +368,15 @@ def shard_model_for_tp(
     tp_layer_replacements = []
 
     for name, layer in model.named_modules():
+        if "." not in name:
+            continue
         parent_path, attr_name = name.rsplit(".", 1)
         parent_module = model.get_submodule(parent_path)
         if attr_name in column_parallel_patterns:
             weight = layer.weight
             bias = layer.bias
-            new_cp_layer = ColumnParallelLinear(layer.in_features, layer.out_features, group=group, bias=True, gather_output=False)
+            has_bias = layer.bias is not None
+            new_cp_layer = ColumnParallelLinear(layer.in_features, layer.out_features, group=group, bias=has_bias, gather_output=False)
             shard_dim = layer.out_features//world_size
             weight_shard = weight[rank*shard_dim : rank*shard_dim + shard_dim, :]
             if bias is not None:
@@ -385,7 +388,8 @@ def shard_model_for_tp(
         elif attr_name in row_parallel_patterns:
             weight = layer.weight
             bias = layer.bias
-            new_rp_layer = RowParallelLinear(layer.in_features, layer.out_features, group=group, bias=True, input_is_parallel=False)
+            has_bias = layer.bias is not None
+            new_rp_layer = RowParallelLinear(layer.in_features, layer.out_features, group=group, bias=has_bias, input_is_parallel=True)
             shard_dim = layer.in_features//world_size
             weight_shard = weight[:, rank*shard_dim : rank*shard_dim + shard_dim]
             new_rp_layer.weight = nn.Parameter(weight_shard)
@@ -410,8 +414,18 @@ def load_sharded_weights(
     pass
 
 
+class SimpleMLP(nn.Module):
+    def __init__(self, hidden_size, intermediate_size):
+        super().__init__()
+        self.up_proj = nn.Linear(hidden_size, intermediate_size)
+        self.act = nn.GELU()
+        self.down_proj = nn.Linear(intermediate_size, hidden_size)
+    
+    def forward(self, x):
+        return self.down_proj(self.act(self.up_proj(x)))
+
 # =============================================================================
-# SECTION 7: Main / Test Harness
+# Main / Test Harness
 # =============================================================================
 
 def main():
@@ -422,7 +436,43 @@ def main():
     - Run a forward + backward pass
     - Verify gradients are correct across ranks
     """
-    pass
+    
+    import copy
+
+    dist.init_process_group(backend='gloo')
+    group = dist.distributed_c10d._get_default_group()
+    
+    torch.manual_seed(2026)
+    model_ref = SimpleMLP(hidden_size=1024, intermediate_size=4096)
+    model_tp = copy.deepcopy(model_ref)
+    sharded_model = shard_model_for_tp(model_tp, group=group, column_parallel_patterns=["up_proj"], row_parallel_patterns=["down_proj"])
+
+    optimizer = torch.optim.SGD(sharded_model.parameters(), lr=0.001)
+    optimizer_ref = torch.optim.SGD(model_ref.parameters(), lr=0.001)
+
+    for i in range(5):
+        torch.manual_seed(2026)
+        x = torch.randn(2, 16, 1024)    
+        
+        optimizer.zero_grad()
+        optimizer_ref.zero_grad()
+        
+        out_ref = model_ref(x).sum()
+        out_tp = sharded_model(x).sum()
+        assert torch.allclose(out_ref, out_tp, atol=1e-5), f"Outputs don't match at step {i}"
+
+        out_ref.backward()
+        out_tp.backward()
+
+        optimizer.step()
+        optimizer_ref.step()
+
+        if dist.get_rank() == 0:
+            print(f"Step {i}: outputs match!")
+
+    dist.destroy_process_group()
+
+
 
 
 if __name__ == "__main__":
