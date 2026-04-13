@@ -14,6 +14,18 @@ Built to understand distributed training at the primitive level. Every collectiv
 | Data Parallelism | 🔄 In progress |
 
 ---
+
+## Validation
+
+Each parallelism strategy is validated against Karpathy's
+[nanoGPT](https://github.com/karpathy/nanoGPT) with **0** modifications
+to the model architecture. Only the training script is touched.
+
+If the loss curve matches the baseline single-GPU run, the
+implementation is correct.
+
+---
+
 ## Roadmap
 Pipeline Parallelism → Sequence Parallelism → Context Parallelism → Expert Parallelism → FSDP
 
