@@ -2,27 +2,20 @@
 
 **From-scratch 5D parallelism in PyTorch.**
 
-Helios started as a learning project — a way to deeply understand distributed training by implementing it rather than reading about it. The goal is to eventually grow into something close to production-useful, but the priority right now is to get every primitive right and fully understood before moving on.
+Built to understand distributed training at the primitive level. Every collective, every schedule, every sharding decision implemented and validated before moving on.
 
 ---
 
-## Progress
+## What's implemented
 
-### ✅ Done
-- Synchronous collective operations
-
-### 🔜 Up next
-- Async collective operations
-- Process Group Manager
-- Data Parallelism (DDP)
-- Fully Sharded Data Parallelism (FSDP)
-- Tensor Parallelism (TP)
-- Sequence Parallelism (SP)
-- Pipeline Parallelism (PP)
-- Context Parallelism (CP)
-- Expert Parallelism (EP)
+| Component | Status |
+|---|---|
+| Tensor Parallelism | ✅ Validated on CPU |
+| Data Parallelism | 🔄 In progress |
 
 ---
+## Roadmap
+Pipeline Parallelism → Sequence Parallelism → Context Parallelism → Expert Parallelism → FSDP
 
 ## Contributions & ideas welcome
 
