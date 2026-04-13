@@ -131,7 +131,7 @@ class ColumnParallelLinear(nn.Module):
         output_features: int,
         group: dist.ProcessGroup,
         bias: bool = True,
-        gather_output: bool = True,
+        gather_output: bool = False,
     ):
         super().__init__()
 
@@ -180,7 +180,7 @@ class RowParallelLinear(nn.Module):
         output_features: int,
         group: dist.ProcessGroup,
         bias: bool = True,
-        input_is_parallel: bool = False,
+        input_is_parallel: bool = True,
     ):
         super().__init__()
 
@@ -372,6 +372,10 @@ def shard_model_for_tp(
             continue
         parent_path, attr_name = name.rsplit(".", 1)
         parent_module = model.get_submodule(parent_path)
+        
+        if parent_path.endswith("attn"):
+            continue
+        
         if attr_name in column_parallel_patterns:
             weight = layer.weight
             bias = layer.bias
@@ -398,6 +402,7 @@ def shard_model_for_tp(
             tp_layer_replacements.append((parent_module, attr_name, new_rp_layer))
     
     for parent, attr, layer in tp_layer_replacements:
+        print(f"Rank {rank}: Replacing layer {attr} in {parent} with {type(layer).__name__}")
         setattr(parent, attr, layer)
     
     return model
