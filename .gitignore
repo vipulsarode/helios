@@ -1,5 +1,9 @@
 .env
-data_parallel
+data_parallel1.py
+data_parallel2.py
+data_parallel3.py
+data_parallel4.py
+data_parallel5.py
 __pycache__
 *.pyc
 *.pyo
