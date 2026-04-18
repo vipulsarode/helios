@@ -118,24 +118,75 @@ class BucketManager:
         self.bucket_size_mb = bucket_size_mb
         self.param_to_bucket = {}
 
+        # Assuming torch.float32
+        self.grad_size = 4
+        self.total_grad_in_bucket = bucket_size_mb*1024*1024//self.grad_size
 
-        for p in model.parameters():
-            p.register_post_accumulate_grad_hook(self._register_hooks)
+        reversed_params = reversed([param for param in model.parameters()])
+        
+        self.buckets = self._build_buckets(reversed_params)
+        self.num_params_ready_per_bucket = [0 for _ in range(len(self.buckets))]
+        self.async_reqs = []
+        
 
-    def _build_buckets(self, params: List[nn.Parameter], bucket_size_mb: float) -> List[DataParallelBucket]:
-        pass
+        self._register_hooks()
+
+    def _build_buckets(self, params: List[nn.Parameter]) -> List[DataParallelBucket]:
+        
+        curr_bucket_size = 0
+        curr_bucket_params = []
+        buckets = []
+
+        for p in params:
+            if p.requires_grad:
+                curr_bucket_params.append(p)
+                curr_bucket_size += p.numel()
+
+                if curr_bucket_size >= self.total_grad_in_bucket:
+                    bucket = DataParallelBucket(curr_bucket_params, dp_group=self.dp_group)
+                    buckets.append(bucket)
+                    for curr_p in curr_bucket_params:
+                        self.param_to_bucket[curr_p] = bucket
+                    curr_bucket_size = 0
+                    curr_bucket_params = [] 
+
+        if curr_bucket_params:
+            bucket = DataParallelBucket(curr_bucket_params, dp_group=self.dp_group)
+            buckets.append(bucket)            
+            for p in curr_bucket_params:
+                self.param_to_bucket[p] = bucket
+        
+        return buckets           
 
     def _register_hooks(self):
-        pass
+        
+        for p in self.model.parameters():
+            if p.requires_grad:
+                p.register_post_accumulate_grad_hook(self._hook_fn(p, self.buckets.index(self.param_to_bucket[p]))) 
 
     def _hook_fn(self, param: nn.Parameter, bucket_idx: int):
-        pass
+
+        def hook(*unused):
+            bucket_params = len(self.buckets[bucket_idx].params)
+            self.num_params_ready_per_bucket[bucket_idx] += 1
+
+            if self.num_params_ready_per_bucket[bucket_idx]==bucket_params: 
+                self.buckets[bucket_idx].copy_grads_to_buffer()
+                self.async_reqs.append(self.buckets[bucket_idx].all_reduce())
+        return hook
 
     def wait_all_reduces(self):
-        pass
+        for req in self.async_reqs:
+            req.wait()
+        for bucket in self.buckets:
+            bucket.copy_buffer_to_grads()
 
     def reset(self):
-        pass
+        for bucket in self.buckets:
+            bucket.flat_buffer.zero_()
+        self.async_reqs = []
+        self.num_params_ready_per_bucket = [0 for _ in range(len(self.buckets))]
+
 
 
 # =============================================================================
