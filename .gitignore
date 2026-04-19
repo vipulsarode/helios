@@ -1,3 +1,4 @@
+.gitignore
 .env
 data_parallel1.py
 data_parallel2.py

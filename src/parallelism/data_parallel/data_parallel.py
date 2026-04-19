@@ -56,7 +56,7 @@ class DataParallelBucket:
         self.flat_buffer.zero_()
 
     def all_reduce(self):
-        self.async_ar_handle = dist.all_reduce(self.flat_buffer, op=dist.ReduceOp.AVG, group=self.dp_group, async_op=True)
+        self.async_ar_handle = dist.all_reduce(self.flat_buffer, op=dist.ReduceOp.SUM, group=self.dp_group, async_op=True)
         return self.async_ar_handle
 
     def copy_grads_to_buffer(self):
@@ -178,7 +178,9 @@ class BucketManager:
     def wait_all_reduces(self):
         for req in self.async_reqs:
             req.wait()
+
         for bucket in self.buckets:
+            bucket.flat_buffer /= dist.get_world_size()
             bucket.copy_buffer_to_grads()
 
     def reset(self):
@@ -190,7 +192,7 @@ class BucketManager:
 
 
 # =============================================================================
-# SECTION 3: Main Grad Buffer (Optional but Picotron does this)
+# Main Grad Buffer (Optional)
 # =============================================================================
 
 def set_main_grad_buffers(model: nn.Module):
@@ -205,7 +207,7 @@ def set_main_grad_buffers(model: nn.Module):
 
 
 # =============================================================================
-# SECTION 4: Data Parallel Wrapper
+# Data Parallel Wrapper
 # =============================================================================
 
 class DataParallel:
@@ -230,20 +232,25 @@ class DataParallel:
     """
 
     def __init__(self, model: nn.Module, dp_group: dist.ProcessGroup, bucket_size_mb: float = 25.0):
-        pass
+        self.model = model
+        self.dp_group = dp_group
+        self.bucket_manager = BucketManager(model, dp_group, bucket_size_mb)
+        self.broadcast_params()
 
     def pre_backward(self):
-        pass
+        self.bucket_manager.reset()
 
     def post_backward(self):
-        pass
+        self.bucket_manager.wait_all_reduces()
 
     def broadcast_params(self):
-        pass
+        with torch.no_grad():
+            for p in self.model.parameters():
+                dist.broadcast(p, src=0, group=self.dp_group)
 
 
 # =============================================================================
-# SECTION 5: Training Loop Integration
+# Training Loop Integration
 # =============================================================================
 
 def train_step(model, dp_wrapper, optimizer, data, labels, loss_fn):
@@ -258,20 +265,85 @@ def train_step(model, dp_wrapper, optimizer, data, labels, loss_fn):
     6. optimizer.step()
     7. optimizer.zero_grad() (or zero main_grads)
     """
-    pass
+        
+    output = model(data)
+    loss = loss_fn(output, labels)
+    dp_wrapper.pre_backward()
+    loss.backward()
+    dp_wrapper.post_backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
 
 
 # =============================================================================
-# SECTION 6: Process Group Setup (if you want end-to-end)
+# Process Group Setup 
 # =============================================================================
 
-def setup_dp_group(world_size: int, rank: int):
+def setup_dp_group():
     """
     Initialize distributed backend and create the DP process group.
     """
-    pass
+    dist.init_process_group(backend='gloo')
+    process_group = dist.GroupMember.WORLD
+    return process_group
+
+
+class SimpleMLP(nn.Module):
+    def __init__(self, hidden_size, intermediate_size):
+        super().__init__()
+        self.up_proj = nn.Linear(hidden_size, intermediate_size)
+        self.act = nn.GELU()
+        self.down_proj = nn.Linear(intermediate_size, 1)
+    
+    def forward(self, x):
+        return self.down_proj(self.act(self.up_proj(x)))
+
 
 
 if __name__ == "__main__":
     # Your end-to-end test goes here.
-    pass
+    
+    dp_group = setup_dp_group()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    torch.manual_seed(2026)
+    model = SimpleMLP(5, 16)
+    torch.manual_seed(2026)
+    model_base = SimpleMLP(5, 16)
+    
+    dp_wrapper = DataParallel(model, dp_group=dp_group, bucket_size_mb=25)
+
+    # sample train data
+    torch.manual_seed(2027)
+    data  = torch.randn(100, 5)
+    labels = torch.randn(100, 1)
+    torch.manual_seed(2027)
+    data_base  = torch.randn(100, 5)
+    labels_base = torch.randn(100, 1)
+
+    sharded_data_chunks = torch.chunk(data, world_size, dim=0)
+    sharded_label_chunks = torch.chunk(labels, world_size, dim=0)
+    local_data = sharded_data_chunks[rank]
+    local_label = sharded_label_chunks[rank]
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+    optimizer_base = torch.optim.SGD(model_base.parameters(), lr=0.001)
+
+    loss_fn = nn.MSELoss()
+
+    for i in range(10):
+        train_step(model, dp_wrapper, optimizer, local_data, local_label, loss_fn)
+        
+        # for base model
+        output = model_base(data_base)
+        loss_base = loss_fn(output, labels_base)
+        loss_base.backward()
+        
+        optimizer_base.step()
+        optimizer_base.zero_grad()
+
+        for p, p_base in zip(model.parameters(), model_base.parameters()):
+            assert torch.allclose(p, p_base, atol=1e-5), f"Parameters don't match at step {i}"
+            print(f"Parameters match at step {i}")
