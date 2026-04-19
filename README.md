@@ -29,7 +29,7 @@ implementation is correct.
 ---
 
 ## Roadmap
-Pipeline Parallelism → Sequence Parallelism → Context Parallelism → Expert Parallelism → FSDP
+Sequence Parallelism → Context Parallelism → Expert Parallelism → FSDP
 
 ## Contributions & ideas welcome
 
