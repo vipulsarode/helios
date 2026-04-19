@@ -4,6 +4,10 @@ Data Parallelism
 Implement everything from scratch. 
 """
 
+"""
+TODO: Need to add gradient accumulation. For it, instead of copying, we need to add in the main_grad
+"""
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -63,13 +67,14 @@ class DataParallelBucket:
         
         offset = 0
         for p in self.params:
-            self.flat_buffer[offset:offset + p.numel()].view(p.shape).copy_(p.grad)
+            self.flat_buffer[offset:offset + p.numel()].view(p.shape).copy_(p.main_grad)
             offset += p.numel()
 
     def copy_buffer_to_grads(self):
         offset = 0
         for p in self.params:
-            p.grad.copy_(self.flat_buffer[offset:offset + p.numel()].view(p.shape))
+            p.main_grad.copy_(self.flat_buffer[offset:offset + p.numel()].view(p.shape))
+            p.grad.copy_(p.main_grad)
             offset += p.numel()
 
 
@@ -203,7 +208,15 @@ def set_main_grad_buffers(model: nn.Module):
       .main_grad instead of the default .grad
     - This decouples gradient storage from autograd's internal buffers
     """
-    pass
+    def hook_fn(p):
+        def hook(*unused):
+            p.main_grad.copy_(p.grad)
+        
+        return hook
+    
+    for p in model.parameters():
+        p.main_grad = torch.zeros_like(p, dtype=p.dtype, device=p.device)
+        p.register_post_accumulate_grad_hook(hook_fn(p))
 
 
 # =============================================================================
@@ -234,6 +247,9 @@ class DataParallel:
     def __init__(self, model: nn.Module, dp_group: dist.ProcessGroup, bucket_size_mb: float = 25.0):
         self.model = model
         self.dp_group = dp_group
+        
+        set_main_grad_buffers(model)
+
         self.bucket_manager = BucketManager(model, dp_group, bucket_size_mb)
         self.broadcast_params()
 
