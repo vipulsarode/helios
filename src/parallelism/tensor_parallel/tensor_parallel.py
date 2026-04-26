@@ -416,6 +416,7 @@ def load_sharded_weights(
     
     Each rank slices the weights it owns from the full state_dict.
     """
+    # TODO
     pass
 
 
