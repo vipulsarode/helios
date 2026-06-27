@@ -10,7 +10,10 @@ Supports:
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import torch.nn.functional as F
 from typing import Optional, List, Tuple, Any
+
+from config import cfg
 
 
 # =============================================================================
@@ -31,6 +34,9 @@ class PipelineParallelContext:
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
 
+        self.is_first_stage = False
+        self.is_last_stage = False
+        
         if self.rank == 0:
             self.is_first_stage = True
         if self.rank == self.world_size - 1:
@@ -65,23 +71,40 @@ class PipelineStage(nn.Module):
     """
     def __init__(self, full_model_builder, pp_context: PipelineParallelContext):
         super().__init__()
-        self.full_model_builder = full_model_builder
+        # self.full_model_builder = full_model_builder
+        print([type(c).__name__ for c in full_model_builder.children()])
         self.pp_context = pp_context
 
-        self.num_layers = len(self.full_model_builder.named_modules()) // self.pp_context.world_size
-        self.layers = self.full_model_builder[self.pp_context.rank*self.num_layers : (self.pp_context.rank+1)*self.num_layers]
-        self.total_loss = []
+        children = list(full_model_builder.children())
 
-    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        embed_head = children[0]
+        lm_head = children[2]
+
+
+        self.model_layers = list(children[1])
+        total_layers = len(self.model_layers)
+        self.num_layers = total_layers // self.pp_context.world_size
+
+        self.stage_layers = self.model_layers[self.pp_context.rank*self.num_layers : (self.pp_context.rank+1)*self.num_layers]
+        
+        if pp_context.is_first_stage:
+            self.stage_layers = [embed_head] + self.stage_layers
+        if pp_context.is_last_stage:
+            self.stage_layers = self.stage_layers + [lm_head]
+
+
+        self.stage_model = nn.Sequential(*self.stage_layers)
+
+
+    def forward(self, x: torch.Tensor, labels=None) -> torch.Tensor:
         
         if self.pp_context.is_last_stage:
-            for layer in self.layers:
-                loss = layer(x, *args, *kwargs) # input labels here
-                self.total_loss.append(loss)
-            return self.total_loss.sum()
+            logits = self.stage_model(x) 
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+            print(f"Logits Shape: {logits.shape}, Loss Shape: {loss.shape}")
+            return loss
         
-        for layer in self.layers:
-            activations = layer(x)
+        activations = self.stage_model(x)
 
         return activations
 
@@ -108,22 +131,24 @@ class PipelineComms:
     def recv_forward(self, shape, dtype) -> Optional[torch.Tensor]:
         """Receive activation from prev rank during forward pass."""
         
-        buffer = torch.empty(shape, dtype=dtype, requires_grad=True)
+        buffer = torch.empty(shape, dtype=dtype)
         dist.recv(buffer, src=self.pp_context.prev_rank)
+        buffer.requires_grad=True
+        return buffer
 
 
     def send_forward(self, activation: torch.Tensor) -> None:
         """Send activation to next rank during forward pass."""
-        
         dist.send(activation, dst=self.pp_context.next_rank)
 
 
     def recv_backward(self, shape, dtype) -> Optional[torch.Tensor]:
         """Receive grad from next rank during backward pass."""
         
-        buffer = torch.empty(shape, dtype=dtype, requires_grad=True)
+        buffer = torch.empty(shape, dtype=dtype)
         dist.recv(buffer, src=self.pp_context.next_rank)
-        
+        # buffer.requires_grad=True
+        return buffer
 
     def send_backward(self, grad: torch.Tensor) -> None:
         """Send grad to prev rank during backward pass."""
@@ -189,7 +214,6 @@ def pipeline_step_afab(
     pp_context: PipelineParallelContext,
     batch: torch.Tensor,
     targets: Optional[torch.Tensor],
-    loss_fn,
     num_microbatches: int,
 ) -> torch.Tensor:
     """
@@ -209,38 +233,41 @@ def pipeline_step_afab(
       - How do you retain_grad / require_grad on received activations so
         grads can flow back?
     """
-    
+ 
     mbs = split_batch_into_microbatches(batch=batch, num_microbatches=num_microbatches)
     if pp_context.is_last_stage:
         target_mbs = split_batch_into_microbatches(batch=targets, num_microbatches=num_microbatches)
 
     inputs = []
-    activations = []
+    outputs = []
     losses = []
 
-
-    shape = mbs[0].shape
-    dtype = mbs[0].dtype
+ 
+    shape = (cfg.pp.batch_size, cfg.pp.seq_len, cfg.pp.d_model)
+    dtype = cfg.pp.dtype
     
     # forward loop
     for i in range(len(mbs)):
         
         if pp_context.is_first_stage:
             input = mbs[i]
-            activation = stage.forward(input)
-            comms.send_forward(activation.detach())
+            output = stage.forward(input)
+            output.requires_grad_(True)
+            comms.send_forward(output.detach())
+            outputs.append(output)
         elif pp_context.is_last_stage:
             input = comms.recv_forward(shape, dtype)
-            output = stage.forward(input)
-            loss = loss_fn(output, target_mbs[i])
+            print(f"Last stage input: {input.shape}, Last stage targets: {target_mbs[i].shape}")
+            loss = stage.forward(input, labels=target_mbs[i])
+            losses.append(loss)
         else:
             input = comms.recv_forward(shape, dtype)
-            activation = stage.forward(input)
-            comms.send_forward(activation.detach())
+            output = stage.forward(input)
+            comms.send_forward(output.detach())
+            outputs.append(output)
 
         inputs.append(input)
-        activations.append(activation)
-        losses.append(loss)
+        
 
     total_loss = 0
 
@@ -249,19 +276,17 @@ def pipeline_step_afab(
 
         if pp_context.is_first_stage:
             grad = comms.recv_backward(shape, dtype)
-            activations.pop(-1).backward(grad)   
-        
+            outputs.pop(-1).backward(grad)  
         elif pp_context.is_last_stage:
             loss = losses.pop(-1)/num_microbatches
+            print("LOSS :", loss)
             loss.backward()
-            total_loss += loss
+            total_loss += loss.item()
             comms.send_backward(inputs.pop(-1).grad)
-        
         else:
             grad = comms.recv_backward(shape, dtype)
-            activations.pop(-1).backward(grad)
+            outputs.pop(-1).backward(grad)
             comms.send_backward(inputs.pop(-1).grad)
-
 
     return total_loss
 
@@ -330,7 +355,6 @@ def train_step(
     optimizer: torch.optim.Optimizer,
     batch: torch.Tensor,
     targets: torch.Tensor,
-    loss_fn,
     num_microbatches: int,
     schedule: str = "1f1b",
 ) -> torch.Tensor:
@@ -341,12 +365,71 @@ def train_step(
       - optimizer.step
       - return loss
     """
-    pass
+
+    rank = dist.get_rank()
+
+    optimizer.zero_grad()
+
+    if schedule == "afab":
+        loss = pipeline_step_afab(stage, comms, pp_context, batch, targets, num_microbatches)
+    if schedule == "1f1b":
+        loss = pipeline_step_1f1b(stage, comms, pp_context, batch, targets, num_microbatches)
+
+    p = next(stage.parameters())
+    before = p.detach().clone()
+    optimizer.step()
+    print(f"rank {rank} param delta: {(p - before).norm().item():.6e}")
+
+
+
+    return loss
 
 
 # =============================================================================
 # MAIN / TEST HARNESS
 # =============================================================================
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model=64, nhead=4, ff_dim=128, dropout=0.0):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True, dropout=dropout)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, ff_dim),
+            nn.GELU(),
+            nn.Linear(ff_dim, d_model),
+        )
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        x = x + self.attn(x, x, x, need_weights=False)[0]
+        x = self.ln1(x)
+        x = x + self.ff(x)
+        x = self.ln2(x)
+        return x
+
+class TinyTransformer(nn.Module):
+    def __init__(self, vocab_size=256, d_model=64, nhead=4, ff_dim=128, num_layers=8):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, d_model)
+        self.vocab_size = vocab_size
+        self.blocks = nn.ModuleList([
+            TransformerBlock(d_model, nhead, ff_dim) for _ in range(num_layers)
+        ])
+        self.head = nn.Linear(d_model, vocab_size)
+        self.loss_fn = nn.CrossEntropyLoss()
+
+    def forward(self, input_ids):
+        x = self.embed(input_ids)
+        for block in self.blocks:
+            x = block(x)
+        logits = self.head(x)
+
+        # if self.is_last_stage and labels is not None:
+        #     return self.loss_fn(logits.reshape(-1, self.vocab_size), labels.reshape(-1))
+        
+        return logits 
 
 def main():
     """
@@ -357,8 +440,69 @@ def main():
     - validate loss decreases
     - compare against single-GPU reference run for correctness
     """
-    pass
+    
+    dist.init_process_group(backend="gloo")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    process_group = dist.GroupMember.WORLD
 
+    
+
+
+    
+    num_microbatches = 4
+
+    
+    # batches = torch.randint(0, 256, (8, 32))
+    # target_batches = torch.randint(0, 256, (8, 32))
+
+    vocab_size = 256
+    B, S = 8, 32
+
+    # A small FIXED dataset so there's real structure to learn (not fresh noise each step)
+    torch.manual_seed(0)
+    pp_context = PipelineParallelContext(pp_group=process_group)
+    transformer_model = TinyTransformer()
+    comms = PipelineComms(pp_context)
+    stage = PipelineStage(transformer_model, pp_context=pp_context)
+    optimizer = torch.optim.SGD(stage.parameters(), lr=0.01)
+
+
+    batches = torch.randint(0, vocab_size, (B, S))
+    target_batches = batches.clone()  
+
+    torch.manual_seed(0)
+    ref_model = TinyTransformer()             # full model, one process
+    ref_opt = torch.optim.SGD(ref_model.parameters(), lr=0.01)
+    # same fixed copy-task batch
+    
+    print("weights match:", torch.equal(
+    transformer_model.head.weight, ref_model.head.weight))
+    
+    for i in range(15):
+        ref_opt.zero_grad()
+        logits = ref_model(batches)   # full forward, scalar loss
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_batches.view(-1))
+        loss.backward()
+        ref_opt.step()
+        print(f"ref step {i}: {loss.item():.6f}")
+
+
+
+    # pattern = torch.arange(0, 16).repeat(B, S // 16 + 1)[:, :S+1]   # 0,1,2,...,15,0,1,...
+    # batches = pattern[:, :-1].contiguous()        # input:  positions 0..S-1
+    # target_batches = pattern[:, 1:].contiguous()  # target: positions 1..S (next token)
+
+
+
+    batch_loss = 0
+    for i in range(15):
+        # for batch, target_batch in zip(batches, target_batches):
+        loss = train_step(stage, comms, pp_context, optimizer, batches, target_batches, num_microbatches, schedule="afab")
+        batch_loss += loss
+        
+        print(f"Epoch {i+1}: {loss} ")
+        batch_loss = 0
 
 if __name__ == "__main__":
     main()
