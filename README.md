@@ -14,6 +14,7 @@ Built to understand distributed training at the primitive level. Every collectiv
 | Data Parallelism | ✅ Validated on CPU |
 | Pipeline Parallelism | ✅ Validated on CPU |
 | Training and validating NanoGPT on GPUs with (DP+TP+PP) | 🔄 In progress |
+| Context Parallelism | 🔄 In progress |
 
 ---
 
