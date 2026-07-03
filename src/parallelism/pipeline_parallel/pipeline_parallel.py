@@ -295,7 +295,6 @@ def pipeline_step_1f1b(
     pp_context: PipelineParallelContext,
     batch: torch.Tensor,
     targets: Optional[torch.Tensor],
-    loss_fn,
     num_microbatches: int,
 ) -> torch.Tensor:
     """
@@ -332,7 +331,7 @@ def pipeline_step_1f1b(
 
     inputs, outputs = [], []
 
-    
+    total_loss = 0
 
     # warmup
     for i in range(min(warmup_steps, num_microbatches)):
@@ -367,7 +366,8 @@ def pipeline_step_1f1b(
 
             loss = stage.forward(input_activation, target_mbs[i])
             loss = loss/num_microbatches
-            grad = backward_step(pp_context=pp_context, input_activation=input_activation, output_activation=None, loss=loss) 
+            total_loss += loss
+            grad = backward_step(pp_context=pp_context, input_activation=input_activation, output_activation=None, output_grad = None,loss=loss) 
 
             if i == steady_steps - 1:
                 comms.send_backward(grad)
@@ -409,6 +409,8 @@ def pipeline_step_1f1b(
     
     assert (len(inputs) == 0 and len(outputs) == 0 ), f"rank {rank}: inputs={len(inputs)} outputs={len(outputs)}"
     print(f"Microbatches on the rank {rank} are drained successfully!")
+
+    return total_loss
 # =============================================================================
 # BACKWARD HELPER
 # =============================================================================

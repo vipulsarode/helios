@@ -4,6 +4,7 @@ import torch
 @dataclass
 class config:
     num_microbatches = 4
+    batch = 8
     batch_size = 2
     seq_len = 32
     d_model = 64
