@@ -167,8 +167,7 @@ class PipelineComms:
         
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        if torch.cpu.is_available():
-            torch.cpu.synchronize()
+
 
         return recv_buffer
 
@@ -183,8 +182,7 @@ class PipelineComms:
         
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        if torch.cpu.is_available():
-            torch.cpu.synchronize()
+
 
         return recv_buffer
 
@@ -317,19 +315,110 @@ def pipeline_step_1f1b(
       - How do you handle the first and last ranks' asymmetric schedules?
       - When exactly do you call fused vs non-fused comm ops?
     """
-    pass
+    
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
 
+    mbs = split_batch_into_microbatches(batch=batch, num_microbatches=num_microbatches)
+    if pp_context.is_last_stage:
+        target_mbs = split_batch_into_microbatches(batch=targets, num_microbatches=num_microbatches)
 
+    shape = (cfg.pp.batch_size, cfg.pp.seq_len, cfg.pp.d_model)
+    dtype = cfg.pp.dtype
+
+    warmup_steps = min(world_size - rank - 1, num_microbatches - 1)
+    steady_steps = len(mbs) - warmup_steps
+    drain_steps = warmup_steps
+
+    inputs, outputs = [], []
+
+    
+
+    # warmup
+    for i in range(min(warmup_steps, num_microbatches)):
+            
+        if pp_context.is_first_stage:
+            output_activation = stage.forward(mbs[i])
+            comms.send_forward(output_activation)
+            outputs.append(output_activation)
+        elif pp_context.is_last_stage:
+            pass
+        else:    
+            input_activation = comms.recv_forward(shape, dtype)
+            output_activation = stage.forward(input_activation)
+            comms.send_forward(output_activation)
+            inputs.append(input_activation)
+            outputs.append(output_activation)
+
+    input_activation = None  
+    # steady
+    for i in range(steady_steps):
+        
+        if pp_context.is_first_stage:
+            output_activation = stage.forward(mbs[warmup_steps + i]) 
+            outputs.append(output_activation)
+            output_grad = comms.send_forward_recv_backward(output_activation, shape, dtype)
+            backward_step(pp_context=pp_context, input_activation=None, output_activation=outputs.pop(0), output_grad=output_grad)
+        
+        elif pp_context.is_last_stage:
+            
+            if input_activation is None:
+                input_activation = comms.recv_forward(shape, dtype)
+
+            loss = stage.forward(input_activation, target_mbs[i])
+            loss = loss/num_microbatches
+            grad = backward_step(pp_context=pp_context, input_activation=input_activation, output_activation=None, loss=loss) 
+
+            if i == steady_steps - 1:
+                comms.send_backward(grad)
+            else:    
+                input_activation = comms.send_backward_recv_forward(grad, shape, dtype)
+
+        else:
+            
+            if input_activation is None:
+                input_activation = comms.recv_forward(shape, dtype)
+
+            output_activation = stage.forward(input_activation)
+            outputs.append(output_activation)
+            inputs.append(input_activation)
+            output_grad = comms.send_forward_recv_backward(output_activation, shape, dtype)
+            grad = backward_step(pp_context=pp_context, input_activation=inputs.pop(0), output_activation=outputs.pop(0), output_grad=output_grad)
+            
+            if i == steady_steps - 1:
+                comms.send_backward(grad)
+            else:    
+                input_activation = comms.send_backward_recv_forward(grad, shape, dtype)
+            
+
+    # drain
+    for i in range(drain_steps):
+        
+        if pp_context.is_last_stage:
+            pass
+
+        elif pp_context.is_first_stage:
+            output_grad = comms.recv_backward(shape, dtype)
+            backward_step(pp_context=pp_context, input_activation=None, output_activation=outputs.pop(0), output_grad=output_grad, loss = None)
+
+        else:
+            output_grad = comms.recv_backward(shape, dtype)
+            grad = backward_step(pp_context=pp_context, input_activation=inputs.pop(0), output_activation=outputs.pop(0), output_grad=output_grad, loss = None)
+            comms.send_backward(grad)
+    
+    
+    assert (len(inputs) == 0 and len(outputs) == 0 ), f"rank {rank}: inputs={len(inputs)} outputs={len(outputs)}"
+    print(f"Microbatches on the rank {rank} are drained successfully!")
 # =============================================================================
 # BACKWARD HELPER
 # =============================================================================
 
 def backward_step(
+    pp_context : PipelineParallelContext,
     input_activation: Optional[torch.Tensor],
-    output_activation: torch.Tensor,
+    output_activation: Optional[torch.Tensor],
     output_grad: Optional[torch.Tensor],
-    is_last_stage: bool,
-    loss: Optional[torch.Tensor] = None,
+    loss: Optional[torch.Tensor] = None
 ) -> Optional[torch.Tensor]:
     """
     Run backward for a single microbatch on this stage.
@@ -341,7 +430,16 @@ def backward_step(
       - Return input_activation.grad so it can be sent to prev rank.
       - Handle the first stage case (no grad to send).
     """
-    pass
+
+    if pp_context.is_last_stage:
+        loss.backward()
+        return input_activation.grad
+    elif pp_context.is_first_stage:
+        output_activation.backward(output_grad)
+    else:
+        output_activation.backward(output_grad)
+        return input_activation.grad
+
 
 
 # =============================================================================
@@ -488,17 +586,10 @@ def main():
         print(f"ref step {i}: {loss.item():.6f}")
 
 
-
-    # pattern = torch.arange(0, 16).repeat(B, S // 16 + 1)[:, :S+1]   # 0,1,2,...,15,0,1,...
-    # batches = pattern[:, :-1].contiguous()        # input:  positions 0..S-1
-    # target_batches = pattern[:, 1:].contiguous()  # target: positions 1..S (next token)
-
-
-
     batch_loss = 0
     for i in range(15):
         # for batch, target_batch in zip(batches, target_batches):
-        loss = train_step(stage, comms, pp_context, optimizer, batches, target_batches, num_microbatches, schedule="afab")
+        loss = train_step(stage, comms, pp_context, optimizer, batches, target_batches, num_microbatches, schedule="1f1b")
         batch_loss += loss
         
         print(f"Epoch {i+1}: {loss} ")
