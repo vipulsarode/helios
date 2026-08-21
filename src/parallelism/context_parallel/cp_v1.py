@@ -85,7 +85,7 @@ def _merge(o_run, m_run, l_run, o_blk, m_blk, l_blk):
     ## m_run - m_new = -inf -(-inf) which is nana nd will poison eeverything. 
     # # when we reach causal attention, we need to fix this by enforcing a rule. 
     
-    
+
     m_new = torch.maximum(m_run, m_blk) # as both of these are a tensor
 
     o_new = o_run * torch.exp(m_run - m_new) + o_blk * torch.exp(m_blk - m_new)
