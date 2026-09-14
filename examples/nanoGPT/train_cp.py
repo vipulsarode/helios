@@ -34,18 +34,18 @@ from src.parallelism.context_parallel.cp_zigzag_backward import zigzag_attention
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
+eval_interval = 50
 log_interval = 1
-eval_iters = 200
+eval_iters = 20
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_log = True # disabled by default
+wandb_project = 'owt_cp'
+wandb_run_name = 'gpt2_cp2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
+dataset = 'shakespeare_char'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -57,15 +57,15 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+max_iters = 200 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+warmup_iters = 20 # how many steps to warm up for
+lr_decay_iters = 200 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -74,6 +74,7 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps'
 dtype = 'float32' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 
+cp_group = dist.group.WORLD
 cp_size = int(os.environ.get('WORLD_SIZE', 1))
 cp_mode = 'zigzag'          # or 'contiguous'
 base_seed = 1337
@@ -90,7 +91,7 @@ else:
     master_process = True
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
+exec(open('examples/nanoGPT/configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
@@ -99,6 +100,10 @@ class CPPositionEmbedding(nn.Module):
         super().__init__()
         self.wpe = wpe                              # the original nn.Embedding
         self.register_buffer('pos_global', pos_global)
+
+    @property
+    def weight(self):
+        return self.wpe.weight
 
     def forward(self, pos):                         # pos is the wrong arange
         return self.wpe(self.pos_global)            # ignore it, use the right one
@@ -138,7 +143,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
+data_dir = os.path.join('examples/nanoGPT/data', dataset)
 # def get_batch(split):
 #     # We recreate np.memmap every batch to avoid a memory leak, as per
 #     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -213,9 +218,9 @@ class CPAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        q_h, q_t = q.chunk(2, dim=2)
-        k_h, k_t = k.chunk(2, dim=2)
-        v_h, v_t = v.chunk(2, dim=2)
+        q_h, q_t = [t.contiguous() for t in q.chunk(2, dim=2)]
+        k_h, k_t = [t.contiguous() for t in k.chunk(2, dim=2)]
+        v_h, v_t = [t.contiguous() for t in v.chunk(2, dim=2)]
 
         o_h, o_t = zigzag_attention(q_h, q_t, k_h, k_t, v_h, v_t,
                                     self.cp_group, self.cp_size,
@@ -287,8 +292,7 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
-for block in model.transformer.h:
-    block.attn = CPAttention(block.attn, cp_group, cp_size, cp_rank)
+
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -296,6 +300,8 @@ scaler = torch.amp.GradScaler(enabled=(dtype == 'float16'))
 if cp_size > 1:
     pos_global = zigzag_split(torch.arange(block_size).unsqueeze(0), cp_rank, cp_size).squeeze(0).to(device)
     model.transformer.wpe = CPPositionEmbedding(model.transformer.wpe, pos_global)
+    for block in model.transformer.h:
+        block.attn = CPAttention(block.attn, cp_group, cp_size, cp_rank)
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -309,9 +315,9 @@ if compile:
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
 
-# wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+# # wrap model into DDP container
+# if ddp:
+#     model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
@@ -366,10 +372,11 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y = get_batch('train', 0) # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
+# raw_model = model.module if ddp else model # unwrap DDP container if needed
+raw_model = model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
 
@@ -379,30 +386,31 @@ while True:
         param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 0:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+        if master_process:
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr,
+                    "mfu": running_mfu*100, # convert to percentage
+                }, step = iter_num)
+            if losses['val'] < best_val_loss or always_save_checkpoint:
+                best_val_loss = losses['val']
+                if iter_num > 0:
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': config,
+                    }
+                    print(f"saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
 
@@ -419,9 +427,23 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y = get_batch('train', iter_num * gradient_accumulation_steps + micro_step + 1)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
+     # all-reduce parameter grads across CP
+    if cp_size > 1:
+        for p in model.parameters():
+            if p.grad is not None:
+                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, group=cp_group)
+
+    if iter_num == 0 and master_process:
+        dump = {}
+        for name, p in model.named_parameters():
+            if p.grad is not None:
+                dump[name] = p.grad.detach().float().cpu().clone()
+        torch.save(dump, f'/workspace/grads_cp{cp_size}.pt')
+        print(f"saved grads_cp{cp_size}.pt")
+    
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
@@ -436,20 +458,18 @@ while True:
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-    if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+    if iter_num % log_interval == 0:
         if cp_size > 1:
             loss_report = loss.detach() * gradient_accumulation_steps
             dist.all_reduce(loss_report, op=dist.ReduceOp.AVG, group=cp_group)
             lossf = loss_report.item()
         else:
             lossf = loss.item() * gradient_accumulation_steps
-        # lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if master_process:
+            if local_iter_num >= 5:
+                mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+                running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 
@@ -457,5 +477,5 @@ while True:
     if iter_num > max_iters:
         break
 
-if ddp:
+if cp_size > 1:
     destroy_process_group()
